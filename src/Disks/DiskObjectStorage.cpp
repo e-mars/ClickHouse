@@ -638,7 +638,7 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorage::writeFile(
             [blob_name, count] (DiskObjectStorage::Metadata & metadata) { metadata.addObject(blob_name, count); return true; });
     };
 
-    return object_storage->writeObject(path, {}, create_metadata_callback, buf_size, settings);
+    return object_storage->writeObject(fs::path(remote_fs_root_path) / blob_name, {}, create_metadata_callback, buf_size, settings);
 }
 
 
