@@ -46,7 +46,7 @@ struct ObjectMetadata
 {
     uint64_t size_bytes;
     std::optional<Poco::Timestamp> last_modified;
-    std::optional<ObjectAttributes> attribtues;
+    std::optional<ObjectAttributes> attributes;
 };
 
 using FinalizeCallback = std::function<void(size_t bytes_count)>;

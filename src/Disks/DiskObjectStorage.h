@@ -27,13 +27,16 @@ public:
         const String & log_name,
         DiskPtr metadata_disk_,
         ObjectStoragePtr && object_storage_,
-        DiskType disk_type_)
+        DiskType disk_type_,
+        bool send_metadata_)
         : name(name_)
         , remote_fs_root_path(remote_fs_root_path_)
         , log (&Poco::Logger::get(log_name))
         , metadata_disk(metadata_disk_)
         , disk_type(disk_type_)
         , object_storage(std::move(object_storage_))
+        , send_metadata(send_metadata_)
+        , metadata_helper(std::make_unique<DiskObjectStorageMetadataHelper>(this, ReadSettings{}))
     {}
 
     DiskType getType() const override { return disk_type; }
@@ -178,7 +181,9 @@ private:
 
     bool tryReserve(UInt64 bytes);
 
-    DiskObjectStorageMetadataHelper * metadata_helper;
+    bool send_metadata;
+
+    std::unique_ptr<DiskObjectStorageMetadataHelper> metadata_helper;
 };
 
 struct DiskObjectStorage::Metadata
@@ -276,7 +281,6 @@ public:
     struct RestoreInformation
     {
         UInt64 revision = LATEST_REVISION;
-        String source_bucket;
         String source_path;
         bool detached = false;
     };
@@ -296,22 +300,11 @@ public:
     void restore();
     void readRestoreInformation(RestoreInformation & restore_information);
     void restoreFiles(const RestoreInformation & restore_information);
-    void processRestoreFiles(const String & source_bucket, const String & source_path, std::vector<String> keys);
+    void processRestoreFiles(const String & source_path, std::vector<String> keys);
     void restoreFileOperations(const RestoreInformation & restore_information);
-
-    /// Remove 'path' prefix from 'key' to get relative key.
-    /// It's needed to store keys to metadata files in RELATIVE_PATHS version.
-    static String shrinkKey(const String & path, const String & key);
-    std::tuple<UInt64, String> extractRevisionAndOperationFromKey(const String & key);
-
-    /// Forms detached path '../../detached/part_name/' from '../../part_name/'
-    static String pathToDetached(const String & source_path);
 
     std::atomic<UInt64> revision_counter = 0;
     inline static const String RESTORE_FILE_NAME = "restore";
-
-    /// Key has format: ../../r{revision}-{operation}
-    const re2::RE2 key_regexp {".*/r(\\d+)-(\\w+)$"};
 
     /// Object contains information about schema version.
     inline static const String SCHEMA_VERSION_OBJECT = ".SCHEMA_VERSION";

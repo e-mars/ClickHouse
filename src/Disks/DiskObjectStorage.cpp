@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage.h>
 
+#include <IO/ReadBufferFromString.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromFile.h>
@@ -28,6 +29,7 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
     extern const int BAD_FILE_TYPE;
     extern const int MEMORY_LIMIT_EXCEEDED;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 DiskObjectStorage::Metadata DiskObjectStorage::Metadata::readMetadata(const String & remote_fs_root_path_, DiskPtr metadata_disk_, const String & metadata_file_path_)
@@ -563,7 +565,21 @@ void DiskObjectStorage::shutdown()
 
 void DiskObjectStorage::startup()
 {
+
+    LOG_INFO(log, "Starting up disk {}", name);
     object_storage->startup();
+
+    if (send_metadata)
+    {
+        metadata_helper->restore();
+
+        if (metadata_helper->readSchemaVersion(remote_fs_root_path) < DiskObjectStorageMetadataHelper::RESTORABLE_SCHEMA_VERSION)
+            metadata_helper->migrateToRestorableSchema();
+
+        metadata_helper->findLastRevision();
+    }
+
+    LOG_INFO(log, "Disk {} started up", name);
 }
 
 ReservationPtr DiskObjectStorage::reserve(UInt64 bytes)
@@ -828,7 +844,6 @@ void DiskObjectStorageMetadataHelper::restore()
     try
     {
         RestoreInformation information;
-        information.source_bucket = disk->bucket;
         information.source_path = disk->remote_fs_root_path;
 
         readRestoreInformation(information);
@@ -837,27 +852,24 @@ void DiskObjectStorageMetadataHelper::restore()
         if (!information.source_path.ends_with('/'))
             information.source_path += '/';
 
-        if (information.source_bucket == disk->bucket)
-        {
-            /// In this case we need to additionally cleanup S3 from objects with later revision.
-            /// Will be simply just restore to different path.
-            if (information.source_path == disk->remote_fs_root_path && information.revision != LATEST_REVISION)
-                throw Exception("Restoring to the same bucket and path is allowed if revision is latest (0)", ErrorCodes::BAD_ARGUMENTS);
+        /// In this case we need to additionally cleanup S3 from objects with later revision.
+        /// Will be simply just restore to different path.
+        if (information.source_path == disk->remote_fs_root_path && information.revision != LATEST_REVISION)
+            throw Exception("Restoring to the same bucket and path is allowed if revision is latest (0)", ErrorCodes::BAD_ARGUMENTS);
 
-            /// This case complicates S3 cleanup in case of unsuccessful restore.
-            if (information.source_path != remote_fs_root_path && disk->remote_fs_root_path.starts_with(information.source_path))
-                throw Exception("Restoring to the same bucket is allowed only if source path is not a sub-path of configured path in S3 disk", ErrorCodes::BAD_ARGUMENTS);
-        }
+        /// This case complicates S3 cleanup in case of unsuccessful restore.
+        if (information.source_path != disk->remote_fs_root_path && disk->remote_fs_root_path.starts_with(information.source_path))
+            throw Exception("Restoring to the same bucket is allowed only if source path is not a sub-path of configured path in S3 disk", ErrorCodes::BAD_ARGUMENTS);
 
-        LOG_INFO(disk->log, "Starting to restore disk {}. Revision: {}, Source bucket: {}, Source path: {}",
-                 name, information.revision, information.source_bucket, information.source_path);
+        LOG_INFO(disk->log, "Starting to restore disk {}. Revision: {}, Source path: {}",
+                 disk->name, information.revision, information.source_path);
 
-        if (readSchemaVersion(information.source_bucket, information.source_path) < RESTORABLE_SCHEMA_VERSION)
+        if (readSchemaVersion(information.source_path) < RESTORABLE_SCHEMA_VERSION)
             throw Exception("Source bucket doesn't have restorable schema.", ErrorCodes::BAD_ARGUMENTS);
 
         LOG_INFO(disk->log, "Removing old metadata...");
 
-        bool cleanup_s3 = information.source_bucket != disk->bucket || information.source_path != disk->remote_fs_root_path;
+        bool cleanup_s3 = information.source_path != disk->remote_fs_root_path;
         for (const auto & root : data_roots)
             if (disk->exists(root))
                 disk->removeSharedRecursive(root + '/', !cleanup_s3, {});
@@ -881,8 +893,7 @@ void DiskObjectStorageMetadataHelper::restore()
 
 void DiskObjectStorageMetadataHelper::readRestoreInformation(RestoreInformation & restore_information)
 {
-    const ReadSettings read_settings;
-    auto buffer = disk->metadata_disk->readFile(RESTORE_FILE_NAME, read_settings, 512);
+    auto buffer = disk->metadata_disk->readFile(RESTORE_FILE_NAME, ReadSettings{}, 512);
     buffer->next();
 
     try
@@ -915,8 +926,6 @@ void DiskObjectStorageMetadataHelper::readRestoreInformation(RestoreInformation 
 
             if (key == "revision")
                 readIntText(restore_information.revision, value_buffer);
-            else if (key == "source_bucket")
-                readText(restore_information.source_bucket, value_buffer);
             else if (key == "source_path")
                 readText(restore_information.source_path, value_buffer);
             else if (key == "detached")
@@ -932,18 +941,36 @@ void DiskObjectStorageMetadataHelper::readRestoreInformation(RestoreInformation 
     }
 }
 
+static String shrinkKey(const String & path, const String & key)
+{
+    if (!key.starts_with(path))
+        throw Exception("The key " + key + " prefix mismatch with given " + path, ErrorCodes::LOGICAL_ERROR);
+
+    return key.substr(path.length());
+}
+
+static std::tuple<UInt64, String> extractRevisionAndOperationFromKey(const String & key)
+{
+    String revision_str;
+    String operation;
+    /// Key has format: ../../r{revision}-{operation}
+    static const re2::RE2 key_regexp {".*/r(\\d+)-(\\w+)$"};
+
+    re2::RE2::FullMatch(key, key_regexp, &revision_str, &operation);
+
+    return {(revision_str.empty() ? 0 : static_cast<UInt64>(std::bitset<64>(revision_str).to_ullong())), operation};
+}
+
 void DiskObjectStorageMetadataHelper::restoreFiles(const RestoreInformation & restore_information)
 {
-    LOG_INFO(log, "Starting restore files for disk {}", name);
+    LOG_INFO(disk->log, "Starting restore files for disk {}", disk->name);
 
     std::vector<std::future<void>> results;
-    auto restore_files = [this, &restore_information, &results](auto list_result)
+    auto restore_files = [this, &restore_information, &results](const BlobsPathToSize & keys)
     {
-        std::vector<String> keys;
-        for (const auto & row : list_result.GetContents())
+        std::vector<String> keys_names;
+        for (const auto & [key, size] : keys)
         {
-            const String & key = row.GetKey();
-
             /// Skip file operations objects. They will be processed separately.
             if (key.find("/operations/") != String::npos)
                 continue;
@@ -953,14 +980,14 @@ void DiskObjectStorageMetadataHelper::restoreFiles(const RestoreInformation & re
             if (revision > restore_information.revision)
                 continue;
 
-            keys.push_back(key);
+            keys_names.push_back(key);
         }
 
-        if (!keys.empty())
+        if (!keys_names.empty())
         {
-            auto result = getExecutor().execute([this, &restore_information, keys]()
+            auto result = disk->getExecutor().execute([this, &restore_information, keys_names]()
             {
-                processRestoreFiles(restore_information.source_bucket, restore_information.source_path, keys);
+                processRestoreFiles(restore_information.source_path, keys_names);
             });
 
             results.push_back(std::move(result));
@@ -969,25 +996,205 @@ void DiskObjectStorageMetadataHelper::restoreFiles(const RestoreInformation & re
         return true;
     };
 
-    /// Execute.
-    listObjects(restore_information.source_bucket, restore_information.source_path, restore_files);
+    BlobsPathToSize children;
+    disk->object_storage->listPrefix(restore_information.source_path, children);
+    restore_files(children);
 
     for (auto & result : results)
         result.wait();
     for (auto & result : results)
         result.get();
 
-    LOG_INFO(log, "Files are restored for disk {}", name);
+    LOG_INFO(disk->log, "Files are restored for disk {}", disk->name);
 
 }
 
-void DiskObjectStorageMetadataHelper::processRestoreFiles(const String & source_bucket, const String & source_path, std::vector<String> keys)
+void DiskObjectStorageMetadataHelper::processRestoreFiles(const String & source_path, std::vector<String> keys)
 {
+    for (const auto & key : keys)
+    {
+        auto meta = disk->object_storage->getObjectMetadata(key);
+        auto object_attributes = meta.attributes;
+
+        String path;
+        if (object_attributes.has_value())
+        {
+            /// Restore file if object has 'path' in metadata.
+            auto path_entry = object_attributes->find("path");
+            if (path_entry == object_attributes->end())
+            {
+                /// Such keys can remain after migration, we can skip them.
+                LOG_WARNING(disk->log, "Skip key {} because it doesn't have 'path' in metadata", key);
+                continue;
+            }
+
+            path = path_entry->second;
+        }
+        else
+            continue;
+
+
+        disk->createDirectories(directoryPath(path));
+        auto relative_key = shrinkKey(source_path, key);
+
+        /// Copy object if we restore to different bucket / path.
+        if (disk->remote_fs_root_path != source_path)
+            disk->object_storage->copyObject(key, disk->remote_fs_root_path + relative_key);
+
+        auto updater = [relative_key, meta] (DiskObjectStorage::Metadata & metadata)
+        {
+            metadata.addObject(relative_key, meta.size_bytes);
+            return true;
+        };
+
+        disk->createUpdateAndStoreMetadata(path, false, updater);
+
+        LOG_TRACE(disk->log, "Restored file {}", path);
+    }
 
 }
+
+static String pathToDetached(const String & source_path)
+{
+    if (source_path.ends_with('/'))
+        return fs::path(source_path).parent_path().parent_path() / "detached/";
+    return fs::path(source_path).parent_path() / "detached/";
+}
+
 void DiskObjectStorageMetadataHelper::restoreFileOperations(const RestoreInformation & restore_information)
 {
+    /// Enable recording file operations if we restore to different bucket / path.
+    bool send_metadata = disk->remote_fs_root_path != restore_information.source_path;
 
+    std::set<String> renames;
+    auto restore_file_operations = [this, &restore_information, &renames, &send_metadata](const BlobsPathToSize & keys)
+    {
+        const String rename = "rename";
+        const String hardlink = "hardlink";
+
+        for (const auto & [key, _]: keys)
+        {
+            const auto [revision, operation] = extractRevisionAndOperationFromKey(key);
+            if (revision == UNKNOWN_REVISION)
+            {
+                LOG_WARNING(disk->log, "Skip key {} with unknown revision", key);
+                continue;
+            }
+
+            /// S3 ensures that keys will be listed in ascending UTF-8 bytes order (revision order).
+            /// We can stop processing if revision of the object is already more than required.
+            if (revision > restore_information.revision)
+                return false;
+
+            /// Keep original revision if restore to different bucket / path.
+            if (send_metadata)
+                revision_counter = revision - 1;
+
+            auto object_attributes = *(disk->object_storage->getObjectMetadata(key).attributes);
+            if (operation == rename)
+            {
+                auto from_path = object_attributes["from_path"];
+                auto to_path = object_attributes["to_path"];
+                if (disk->exists(from_path))
+                {
+                    disk->moveFile(from_path, to_path);
+                    if (send_metadata)
+                    {
+                        auto next_revision = ++revision_counter;
+                        const ObjectAttributes object_metadata {
+                            {"from_path", from_path},
+                            {"to_path", to_path}
+                        };
+                        createFileOperationObject("rename", next_revision, object_attributes);
+                    }
+
+                    LOG_TRACE(disk->log, "Revision {}. Restored rename {} -> {}", revision, from_path, to_path);
+
+                    if (restore_information.detached && disk->isDirectory(to_path))
+                    {
+                        /// Sometimes directory paths are passed without trailing '/'. We should keep them in one consistent way.
+                        if (!from_path.ends_with('/'))
+                            from_path += '/';
+                        if (!to_path.ends_with('/'))
+                            to_path += '/';
+
+                        /// Always keep latest actual directory path to avoid 'detaching' not existing paths.
+                        auto it = renames.find(from_path);
+                        if (it != renames.end())
+                            renames.erase(it);
+
+                        renames.insert(to_path);
+                    }
+                }
+            }
+            else if (operation == hardlink)
+            {
+                auto src_path = object_attributes["src_path"];
+                auto dst_path = object_attributes["dst_path"];
+                if (disk->exists(src_path))
+                {
+                    disk->createDirectories(directoryPath(dst_path));
+                    if (send_metadata && !dst_path.starts_with("shadow/"))
+                    {
+                        auto next_revision = ++revision_counter;
+                        const ObjectAttributes object_metadata {
+                            {"src_path", src_path},
+                            {"dst_path", dst_path}
+                        };
+                        createFileOperationObject("hardlink", next_revision, object_attributes);
+                    }
+                    disk->createHardLink(src_path, dst_path);
+                    LOG_TRACE(disk->log, "Revision {}. Restored hardlink {} -> {}", revision, src_path, dst_path);
+                }
+            }
+        }
+
+        return true;
+    };
+
+    BlobsPathToSize children;
+    disk->object_storage->listPrefix(restore_information.source_path + "operations/", children);
+    restore_file_operations(children);
+
+    if (restore_information.detached)
+    {
+        Strings not_finished_prefixes{"tmp_", "delete_tmp_", "attaching_", "deleting_"};
+
+        for (const auto & path : renames)
+        {
+            /// Skip already detached parts.
+            if (path.find("/detached/") != std::string::npos)
+                continue;
+
+            /// Skip not finished parts. They shouldn't be in 'detached' directory, because CH wouldn't be able to finish processing them.
+            fs::path directory_path(path);
+            auto directory_name = directory_path.parent_path().filename().string();
+
+            auto predicate = [&directory_name](String & prefix) { return directory_name.starts_with(prefix); };
+            if (std::any_of(not_finished_prefixes.begin(), not_finished_prefixes.end(), predicate))
+                continue;
+
+            auto detached_path = pathToDetached(path);
+
+            LOG_TRACE(disk->log, "Move directory to 'detached' {} -> {}", path, detached_path);
+
+            fs::path from_path = fs::path(path);
+            fs::path to_path = fs::path(detached_path);
+            if (path.ends_with('/'))
+                to_path /= from_path.parent_path().filename();
+            else
+                to_path /= from_path.filename();
+
+            /// to_path may exist and non-empty in case for example abrupt restart, so remove it before rename
+            if (disk->metadata_disk->exists(to_path))
+                disk->metadata_disk->removeRecursive(to_path);
+
+            disk->createDirectories(directoryPath(to_path));
+            disk->metadata_disk->moveDirectory(from_path, to_path);
+        }
+    }
+
+    LOG_INFO(disk->log, "File operations restored for disk {}", disk->name);
 }
 
 

@@ -275,7 +275,7 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path) cons
     auto & object_head_result = object_head.GetResult();
     result.size_bytes = object_head_result.GetContentLength();
     result.last_modified = object_head_result.GetLastModified().Millis();
-    result.attribtues = object_head_result.GetMetadata();
+    result.attributes = object_head_result.GetMetadata();
 
     return result;
 }

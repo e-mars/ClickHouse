@@ -23,13 +23,11 @@ struct S3ObjectStorageSettings
     S3ObjectStorageSettings(
         const S3Settings::ReadWriteSettings & s3_settings_,
         uint64_t min_bytes_for_seek_,
-        bool send_metadata_,
         uint64_t thread_pool_size_,
         int32_t list_object_keys_size_,
         int32_t objects_chunk_size_to_delete_)
         : s3_settings(s3_settings_)
         , min_bytes_for_seek(min_bytes_for_seek_)
-        , send_metadata(send_metadata_)
         , thread_pool_size(thread_pool_size_)
         , list_object_keys_size(list_object_keys_size_)
         , objects_chunk_size_to_delete(objects_chunk_size_to_delete_)
@@ -38,7 +36,6 @@ struct S3ObjectStorageSettings
     S3Settings::ReadWriteSettings s3_settings;
 
     uint64_t min_bytes_for_seek;
-    bool send_metadata;
     uint64_t thread_pool_size;
     int32_t list_object_keys_size;
     int32_t objects_chunk_size_to_delete;
